@@ -1,0 +1,8 @@
+# .remote-dev.toml — project root, local only (remote-dev-init writes it and excludes it from Git)
+host        = "devbox"          # SSH alias from ~/.ssh/config
+machine     = "devbox"          # herdr machine label (herdr machine add devbox)
+remote_path = "/srv/myproj"     # absolute project dir on the server
+mutagen     = "myproj"          # mutagen sync session name
+name        = "myproj"          # optional; herdr workspace becomes rdev-myproj
+# wait_sync = 30                # optional: seconds to wait for the sync to connect
+# net_wait  = 300               # optional: seconds to ride out a network loss while waiting

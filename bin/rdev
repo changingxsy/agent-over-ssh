@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# rdev — run a command on the remote dev server through a persistent herdr pane.
+#
+# Files are synced by mutagen; Git lives only on this machine. Before each run,
+# rdev checks the sync (fails fast when offline), flushes it, captures local Git
+# metadata and injects it as VERSION / COMMIT / COMMIT_FULL / BUILD_DATE /
+# SOURCE_DIRTY. Commands run in a dedicated herdr workspace "rdev-<name>" on the
+# server, so they survive laptop sleep and network changes.
+#
+# Usage:
+#   rdev [--timeout SEC] [--force] '<command>'   run and wait; print output; exit with remote code
+#   rdev --bg '<command>'                         start without waiting; print token
+#   rdev --wait TOKEN [--timeout SEC]             wait for / collect a run (e.g. after network loss)
+#   rdev --log TOKEN [--lines N]                  print the log of a run
+#   rdev up [--quiet]                             ensure sync + herdr + pane; report uncollected jobs
+#   rdev --clear-stale                            drop busy markers of crashed runs
+#
+# rdev's own exit codes (the remote command's code is passed through otherwise):
+#   2 config/environment   3 sync offline/halted   4 sync conflicts
+#   124 still running after --timeout   125 server unreachable (job keeps running)
+#
+# Config: .remote-dev.toml in the project root (searched upward from $PWD):
+#   host = "devbox"  machine = "devbox"  remote_path = "/root/proj"  mutagen = "proj"
+#   name = "proj" (optional; default: dir name)  wait_sync = 30  net_wait = 300  (optional, seconds)
+set -uo pipefail
+
+note() { echo "rdev: $*" >&2; }
+die() { local code=$1; shift; note "$*"; exit "$code"; }
+
+find_root() {
+  local d=$PWD
+  while [[ $d != / ]]; do
+    [[ -f $d/.remote-dev.toml ]] && { echo "$d"; return; }
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+ROOT=$(find_root) || die 2 "no .remote-dev.toml found from $PWD upward"
+cfg() { sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" "$ROOT/.remote-dev.toml" | head -1 | sed 's/[[:space:]]*$//'; }
+HOST=$(cfg host); MACHINE=$(cfg machine); RPATH=$(cfg remote_path); SESSION=$(cfg mutagen)
+[[ -n $HOST && -n $MACHINE && -n $RPATH && -n $SESSION ]] || die 2 "incomplete $ROOT/.remote-dev.toml"
+NAME=$(cfg name); NAME=${NAME:-$(basename "$ROOT")}
+NAME=$(tr 'A-Z' 'a-z' <<<"$NAME" | tr -c 'a-z0-9_\n-' '-')
+WAIT_SYNC=$(cfg wait_sync); WAIT_SYNC=${WAIT_SYNC:-30}
+NET_WAIT=$(cfg net_wait); NET_WAIT=${NET_WAIT:-300}
+
+REL=${PWD#"$ROOT"}; RDIR="$RPATH$REL"
+RUNDIR="~/.rdev/run/$NAME"
+LABEL="rdev-$NAME"
+STATE="$HOME/.cache/rdev"; mkdir -p "$STATE"
+PANE_CACHE="$STATE/$NAME.pane"; JOBS="$STATE/$NAME.jobs"
+PANE=""; SYNC_ST=""
+
+# Hard time limit for any external call (macOS has no timeout(1)); SIGALRM -> exit 142.
+tmo() { local s=$1; shift; perl -e '$t = shift; alarm $t; exec @ARGV; exit 127' "$s" "$@"; }
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+S() { tmo "${S_TMO:-60}" ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+H() { tmo "${H_TMO:-45}" herdr --machine "$MACHINE" "$@"; }
+
+# ---------- jobs (local record, so runs interrupted by network loss are not forgotten)
+job_add() { printf '%s\trunning\t%s\n' "$1" "$(tr '\n\t' '  ' <<<"$2" | cut -c1-120)" >>"$JOBS"; }
+job_set() {
+  [[ -f $JOBS ]] || return 0
+  awk -F'\t' -v OFS='\t' -v t="$1" -v s="$2" '$1==t{$2=s} {print}' "$JOBS" | tail -n 50 >"$JOBS.tmp" && mv "$JOBS.tmp" "$JOBS"
+}
+jobs_running() { [[ -f $JOBS ]] && awk -F'\t' '$2=="running"{print $1}' "$JOBS"; }
+
+# ---------- sync
+sync_status() { tmo 20 mutagen sync list "$SESSION" 2>/dev/null | sed -n 's/^Status: //p' | head -1; }
+
+# 0 ready, 3 offline, 4 conflicts, 5 halted
+sync_ready() {
+  local deadline=$((SECONDS + WAIT_SYNC))
+  SYNC_ST=$(sync_status)
+  [[ -n $SYNC_ST ]] || die 2 "mutagen session '$SESSION' not found (mutagen sync list)"
+  [[ $SYNC_ST == *Paused* ]] && tmo 20 mutagen sync resume "$SESSION" >/dev/null 2>&1
+  while :; do
+    SYNC_ST=$(sync_status)
+    case $SYNC_ST in
+      Halted*) return 5 ;;
+      ""|Disconnected*|Connecting*|*Paused*) ;;
+      *) break ;;
+    esac
+    ((SECONDS >= deadline)) && return 3
+    sleep 2
+  done
+  tmo 90 mutagen sync flush "$SESSION" >/dev/null 2>&1 || { SYNC_ST="flush timed out"; return 3; }
+  tmo 20 mutagen sync list "$SESSION" 2>/dev/null | grep -q '^Conflicts:' && return 4
+  return 0
+}
+
+sync_or_die() {
+  sync_ready
+  case $? in
+    0) ;;
+    3) die 3 "sync offline (status: ${SYNC_ST:-unknown}) — local edits stay queued; not running on stale remote code. Retry when the network is back (rdev up)." ;;
+    4) die 4 "mutagen session '$SESSION' has conflicts; resolve them first (mutagen sync list $SESSION)" ;;
+    5) die 3 "mutagen session '$SESSION' halted: $SYNC_ST (mutagen sync list $SESSION)" ;;
+  esac
+}
+
+# ---------- herdr
+herdr_diag() {
+  local out st err
+  out=$(tmo 30 herdr machine status "$MACHINE" --json 2>&1)
+  st=$(jq -r '.[0].status // empty' <<<"$out" 2>/dev/null); err=$(jq -r '.[0].error // empty' <<<"$out" 2>/dev/null)
+  case $st in
+    reachable) note "herdr machine '$MACHINE' is reachable but its API call failed; the remote herdr server may be down — run in your terminal: herdr machine add $HOST"; return 2 ;;
+    "") note "herdr machine status failed (network?): ${out:0:200}"; return 125 ;;
+    *)
+      note "herdr machine '$MACHINE': $st${err:+ — $err}"
+      [[ $st$err == *[Aa]uth* ]] && note "run in your terminal: herdr machine reconnect $MACHINE"
+      return 125 ;;
+  esac
+}
+
+# Find or create the dedicated pane (workspace label rdev-<name>, cwd = remote_path).
+ensure_pane() {
+  local p out ws
+  p=$(cat "$PANE_CACHE" 2>/dev/null || true)
+  if [[ -n $p ]]; then
+    out=$(H pane get "$p" 2>&1) && { PANE=$p; return 0; }
+    [[ $out == *pane_not_found* ]] || { herdr_diag; return $?; }
+  fi
+  p=""
+  out=$(H workspace list 2>&1) || { herdr_diag; return $?; }
+  ws=$(jq -r --arg l "$LABEL" '.result.workspaces[] | select(.label==$l) | .workspace_id' <<<"$out" | head -1)
+  [[ -n $ws ]] && p=$(H pane list --workspace "$ws" 2>/dev/null | jq -r '.result.panes[0].pane_id // empty')
+  if [[ -z $p ]]; then
+    out=$(H workspace create --cwd "$RPATH" --label "$LABEL" --no-focus 2>&1) || { note "herdr workspace create failed: ${out:0:200}"; return 125; }
+    p=$(jq -r '.result.root_pane.pane_id // empty' <<<"$out")
+    [[ -n $p ]] || { note "unexpected workspace create output: ${out:0:200}"; return 2; }
+    sleep 1 # let the shell reach its prompt
+    note "created herdr workspace $LABEL (pane $p) on $MACHINE"
+  fi
+  echo "$p" >"$PANE_CACHE"; PANE=$p
+}
+
+# ---------- git metadata
+# Also written into the synced tree for builds not started by rdev.
+git_meta() {
+  VERSION=dev COMMIT=none COMMIT_FULL=none SOURCE_DIRTY=false
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    VERSION=$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)
+    COMMIT_FULL=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo none)
+    COMMIT=${COMMIT_FULL:0:7}
+    [[ -n $(git -C "$ROOT" status --porcelain 2>/dev/null) ]] && { SOURCE_DIRTY=true; COMMIT+=-dirty; }
+    local json files
+    json=$(printf '{"version":"%s","commit":"%s","commit_full":"%s","dirty":%s}\n' "$VERSION" "$COMMIT" "$COMMIT_FULL" "$SOURCE_DIRTY")
+    [[ $(cat "$ROOT/.build-meta.json" 2>/dev/null) == "$json" ]] || printf '%s\n' "$json" >"$ROOT/.build-meta.json"
+    files=$(mktemp)
+    git -C "$ROOT" ls-files --cached --others --exclude-standard -z >"$files"
+    if cmp -s "$files" "$ROOT/.build-meta.files" 2>/dev/null; then rm -f "$files"; else mv "$files" "$ROOT/.build-meta.files"; fi
+  fi
+  BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+}
+
+q() { printf '%q' "$1"; }
+
+# ---------- run
+start_run() {
+  local cmd=$1 force=$2 busy line
+  sync_or_die
+  ensure_pane || exit $?
+  if [[ $force != 1 ]]; then
+    busy=$(S_TMO=30 S "ls $RUNDIR/*.running 2>/dev/null | head -3") || die 125 "server unreachable"
+    [[ -z $busy ]] || die 2 "pane busy (running: $(basename -a $busy | sed 's/\.running$//' | tr '\n' ' ')); use rdev --wait/--log, --force, or --clear-stale"
+  fi
+  git_meta
+  TOKEN=$(date +%Y%m%d-%H%M%S)-$RANDOM
+  {
+    echo '#!/bin/bash'
+    echo "cd $(q "$RDIR") || exit 97"
+    echo "export VERSION=$(q "$VERSION") COMMIT=$(q "$COMMIT") COMMIT_FULL=$(q "$COMMIT_FULL") BUILD_DATE=$(q "$BUILD_DATE") SOURCE_DIRTY=$(q "$SOURCE_DIRTY")"
+    printf '%s\n' "$cmd"
+  } | S_TMO=30 S "mkdir -p $RUNDIR && cat > $RUNDIR/$TOKEN.sh" || die 125 "server unreachable while uploading the command"
+  line="touch $RUNDIR/$TOKEN.running; bash $RUNDIR/$TOKEN.sh 2>&1 | tee $RUNDIR/$TOKEN.log; rc=\${PIPESTATUS[0]}; echo \$rc > $RUNDIR/$TOKEN.rc; rm -f $RUNDIR/$TOKEN.running; echo __RDEV_END_$TOKEN:\$rc"
+  if ! H_TMO=30 H pane run "$PANE" "$line" >/dev/null 2>&1; then
+    job_add "$TOKEN" "$cmd"
+    die 125 "submitting to pane $PANE failed; it may or may not have started — check 'rdev --wait $TOKEN' before retrying"
+  fi
+  job_add "$TOKEN" "$cmd"
+}
+
+# Wait in 60s chunks; poll the authoritative .rc file; survive network loss up to NET_WAIT.
+wait_run() {
+  local t=$1 timeout=$2 deadline rem chunk began out net_since=""
+  deadline=$((SECONDS + timeout))
+  PANE=${PANE:-$(cat "$PANE_CACHE" 2>/dev/null || true)}
+  while :; do
+    rem=$((deadline - SECONDS))
+    ((rem > 0)) || die 124 "still running after ${timeout}s — token $t (rdev --wait $t / rdev --log $t)"
+    chunk=$((rem < 60 ? rem : 60)); began=$SECONDS
+    if [[ -n $PANE ]] && H_TMO=$((chunk + 30)) H pane wait-output "$PANE" --regex "__RDEV_END_${t}:[0-9]+" \
+      --source recent-unwrapped --lines 400 --timeout $((chunk * 1000)) >/dev/null 2>&1; then
+      return 0
+    fi
+    if out=$(S_TMO=30 S "if [ -f $RUNDIR/$t.rc ]; then echo done; elif [ -f $RUNDIR/$t.running ]; then echo running; else echo missing; fi"); then
+      [[ -n $net_since ]] && { note "connection restored; job $t is $out"; net_since=""; }
+      case $out in
+        done) return 0 ;;
+        missing) job_set "$t" lost; die 2 "job $t not found on the server (never started, or the server/herdr restarted)" ;;
+      esac
+      ((SECONDS - began < 5)) && sleep 5
+    else
+      [[ -n $net_since ]] || { net_since=$SECONDS; note "server unreachable; job $t keeps running there — retrying (up to ${NET_WAIT}s)"; }
+      ((SECONDS - net_since >= NET_WAIT)) && die 125 "server unreachable for ${NET_WAIT}s; job $t keeps running. When back online: rdev up && rdev --wait $t"
+      sleep 10
+    fi
+  done
+}
+
+show_log() {
+  local t=$1 lines=$2 total
+  total=$(S_TMO=30 S "wc -l < $RUNDIR/$t.log" 2>/dev/null) || die 125 "server unreachable; job $t log not fetched"
+  ((total > lines)) && note "output truncated to last $lines of $total lines (rdev --log $t --lines N)"
+  S "tail -n $lines $RUNDIR/$t.log" || die 125 "server unreachable while fetching the log of $t"
+}
+
+finish() {
+  local t=$1 rc
+  show_log "$t" "$LINES_OUT"
+  rc=$(S_TMO=30 S "cat $RUNDIR/$t.rc" 2>/dev/null) || die 125 "server unreachable; exit code of $t unknown (rdev --wait $t)"
+  job_set "$t" "done:$rc"
+  tmo 60 mutagen sync flush "$SESSION" >/dev/null 2>&1 # bring back files generated on the server
+  note "[$t] exit $rc"
+  exit "$rc"
+}
+
+# ---------- up / status
+report_jobs() {
+  local toks out t st
+  toks=$(jobs_running | tr '\n' ' ')
+  [[ -n ${toks// /} ]] || return 0
+  out=$(S_TMO=30 S "for t in $toks; do if [ -f $RUNDIR/\$t.rc ]; then echo \"\$t done:\$(cat $RUNDIR/\$t.rc)\"; elif [ -f $RUNDIR/\$t.running ]; then echo \"\$t running\"; else echo \"\$t lost\"; fi; done") || return 0
+  while read -r t st; do
+    [[ -n $t ]] || continue
+    case $st in
+      done:*) echo "job $t finished (exit ${st#done:}) while not collected — rdev --log $t"; job_set "$t" "$st" ;;
+      running) echo "job $t still running — rdev --wait $t" ;;
+      lost) echo "job $t lost (server or herdr restarted)"; job_set "$t" lost ;;
+    esac
+  done <<<"$out"
+}
+
+up() {
+  local quiet=$1 src prc sync_s herdr_s
+  sync_ready; src=$?
+  case $src in 0) sync_s=ok ;; 3) sync_s="offline(${SYNC_ST:-unknown})" ;; 4) sync_s=conflicts ;; *) sync_s="halted(${SYNC_ST})" ;; esac
+  ensure_pane 2>"$STATE/$NAME.err"; prc=$?
+  if ((prc == 0)); then herdr_s="ok pane=$PANE"; else herdr_s="unavailable: $(tail -n 2 "$STATE/$NAME.err" | sed 's/^rdev: //' | tr '\n' ' ')"; fi
+  echo "remote-dev[$NAME]: sync=$sync_s herdr=$herdr_s remote=$HOST:$RPATH"
+  ((prc == 0)) && report_jobs
+  [[ $quiet == 1 ]] || mutagen sync list "$SESSION" 2>/dev/null | grep -E '^(Status|Conflicts)' | sed 's/^/  /'
+  ((src == 0 && prc == 0)) || exit $((src ? 3 : prc))
+}
+
+TIMEOUT=1800 FORCE=0 MODE=run TOKEN_ARG="" LINES_OUT=300 QUIET=0
+[[ ${1:-} == up ]] && { MODE=up; shift; }
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --timeout) TIMEOUT=$2; shift 2 ;;
+    --lines) LINES_OUT=$2; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --bg) MODE=bg; shift ;;
+    --wait) MODE=wait; TOKEN_ARG=$2; shift 2 ;;
+    --log) MODE=log; TOKEN_ARG=$2; shift 2 ;;
+    --status) MODE=up; shift ;;
+    --clear-stale) MODE=clear; shift ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    -*) die 2 "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+
+case $MODE in
+  run) [[ $# -gt 0 ]] || die 2 "missing command"; start_run "$*" "$FORCE"; wait_run "$TOKEN" "$TIMEOUT"; finish "$TOKEN" ;;
+  bg) [[ $# -gt 0 ]] || die 2 "missing command"; start_run "$*" "$FORCE"; echo "$TOKEN" ;;
+  wait) wait_run "$TOKEN_ARG" "$TIMEOUT"; finish "$TOKEN_ARG" ;;
+  log) show_log "$TOKEN_ARG" "$LINES_OUT"; S_TMO=20 S "test -f $RUNDIR/$TOKEN_ARG.rc" 2>/dev/null && job_set "$TOKEN_ARG" seen; true ;;
+  up) up "$QUIET" ;;
+  clear) S "rm -f $RUNDIR/*.running" && { for t in $(jobs_running); do job_set "$t" cleared; done; echo cleared; } ;;
+esac

@@ -1,0 +1,21 @@
+git status
+git commit -m "fix ssh devbox timeout"
+git push origin main
+go test ./...
+gofmt -w .
+cd web && npm run build
+grep -rn "ssh devbox" docs
+echo devbox
+cat ~/.ssh/config
+ssh-add -l
+codex exec "refactor x"
+rdev "go build ./..."
+mutagen sync flush myproj
+herdr --machine devbox pane list
+git add -A && git commit -m "docs: explain why we avoid ssh devbox"
+#EXPECT-DENY
+ssh devbox ls
+cd x && ssh devbox uptime
+scp a devbox:/tmp/
+ssh root@devbox
+ls; ssh -o BatchMode=yes devbox true

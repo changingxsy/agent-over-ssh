@@ -1,0 +1,11 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S error bin/rdev bin/remote-dev-init hooks/rdev-hook.sh install.sh tests/run-guard-tests.sh
+      - name: guard tests
+        run: tests/run-guard-tests.sh

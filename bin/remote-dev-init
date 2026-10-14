@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# remote-dev-init — set up (or resume setting up) a remote-dev project:
+# local Git repo + mutagen sync to a server directory (no Git on the server) + herdr/rdev.
+#
+# Usage:
+#   remote-dev-init --host H --remote /abs/path [--dir ~/work/NAME] [--name NAME]
+#                   [--stack go,node,python] [--machine LABEL] [--migrate-server-git] [--plan]
+#
+#   --plan                 read-only: probe both sides and print what would be done
+#   --migrate-server-git   the remote dir already has .git: pull it to the local repo
+#                          and rename the server copy to .git.migrated-<date> (reversible)
+#
+# Safe to re-run: every step checks whether it is already done.
+# Exit codes: 0 done, 2 usage, 10 needs a decision/flag, 20 needs a manual step (herdr machine add).
+set -uo pipefail
+
+say() { printf '%s\n' "$*"; }
+die() { local c=$1; shift; printf 'remote-dev-init: %s\n' "$*" >&2; exit "$c"; }
+tmo() { local s=$1; shift; perl -e '$t = shift; alarm $t; exec @ARGV; exit 127' "$s" "$@"; }
+
+HOST="" RPATH="" DIR="" NAME="" STACK="" MACHINE="" MIGRATE=0 PLAN=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --host) HOST=$2; shift 2 ;;
+    --remote) RPATH=${2%/}; shift 2 ;;
+    --dir) DIR=${2%/}; shift 2 ;;
+    --name) NAME=$2; shift 2 ;;
+    --stack) STACK=$2; shift 2 ;;
+    --machine) MACHINE=$2; shift 2 ;;
+    --migrate-server-git) MIGRATE=1; shift ;;
+    --plan) PLAN=1; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) die 2 "unknown argument: $1" ;;
+  esac
+done
+[[ -n $HOST && -n $RPATH ]] || die 2 "--host and --remote are required"
+[[ $RPATH == /* ]] || die 2 "--remote must be an absolute path"
+[[ $(tr -cd / <<<"$RPATH" | wc -c) -ge 2 ]] || die 2 "refusing a top-level remote path ($RPATH); use a project directory like /root/<name>"
+NAME=${NAME:-$(basename "$RPATH")}
+NAME=$(tr 'A-Z' 'a-z' <<<"$NAME" | tr -c 'a-z0-9_\n-' '-')
+DIR=${DIR:-$HOME/work/$(basename "$RPATH")}
+MACHINE=${MACHINE:-$HOST}
+SESSION=$NAME
+DATE=$(date +%Y%m%d)
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+RDEV="$(cd "$(dirname "$0")" && pwd)/rdev"; [[ -x $RDEV ]] || RDEV=$(command -v rdev) || die 2 "rdev not found on PATH"
+S() { tmo 120 ssh "${SSH_OPTS[@]}" "$HOST" "$@"; }
+qr=$(printf '%q' "$RPATH")
+
+# ---------- probe
+ssh -G "$HOST" >/dev/null 2>&1 || die 2 "unknown ssh host '$HOST' (check ~/.ssh/config)"
+probe=$(S "if [ -e $qr ]; then echo exists; [ -d $qr/.git ] && echo git; ls -d $qr/.git.migrated-* >/dev/null 2>&1 && echo migrated; [ -n \"\$(ls -A $qr 2>/dev/null | grep -v '^\.git\.migrated-')\" ] && echo nonempty; fi; true") \
+  || die 2 "cannot reach $HOST over ssh"
+has() { grep -qx "$1" <<<"$probe"; }
+local_git=0; [[ -d $DIR/.git ]] && local_git=1
+local_nonempty=0; [[ -d $DIR && -n $(ls -A "$DIR" 2>/dev/null) ]] && local_nonempty=1
+session_exists=0; tmo 20 mutagen sync list "$SESSION" >/dev/null 2>&1 && session_exists=1
+machine_ok=0; herdr machine list --json 2>/dev/null | jq -e --arg m "$MACHINE" '.[] | select((.label==$m or .id==$m) and (.enabled // true))' >/dev/null 2>&1 && machine_ok=1
+
+mode=new
+if has git; then
+  mode=migrate
+elif has nonempty && ! has migrated && [[ $session_exists == 0 ]]; then
+  die 10 "$HOST:$RPATH has files but no .git; adopting an unversioned remote dir is not automated. Move it aside or pick another --remote."
+elif has migrated; then
+  mode=resume
+fi
+[[ $mode == migrate && $MIGRATE == 0 ]] && die 10 "$HOST:$RPATH is a Git checkout. Re-run with --migrate-server-git to move Git to $DIR (server .git is renamed, not deleted)."
+[[ $mode == new && $local_nonempty == 1 && $local_git == 0 ]] && die 10 "$DIR exists, is not empty and has no Git; refusing to commit unknown files. Use an empty/new --dir."
+[[ $mode == migrate && $local_nonempty == 1 && $local_git == 0 ]] && die 10 "$DIR exists and is not empty; use an empty/new --dir for the migration."
+
+if [[ $PLAN == 1 ]]; then
+  say "project:   $NAME   local: $DIR   remote: $HOST:$RPATH   mode: $mode"
+  say "state:     remote=[$(tr '\n' ' ' <<<"$probe")] local_git=$local_git mutagen_session=$session_exists herdr_machine=$machine_ok"
+  case $mode in
+    new) say "will:      mkdir -p remote dir; git init + initial commit in $DIR; write .remote-dev.toml; create mutagen session '$SESSION'" ;;
+    migrate) say "will:      check server repo is clean/pushed; copy server .git to $DIR and check out; rename server .git -> .git.migrated-$DATE; create mutagen session '$SESSION'" ;;
+    resume) say "will:      finish remaining steps (config / mutagen / herdr / verification)" ;;
+  esac
+  [[ $machine_ok == 1 ]] || say "manual:    herdr machine '$MACHINE' not saved — user must run: herdr machine add $HOST"
+  exit 0
+fi
+
+# ---------- 1. remote dir + local repo
+step() { say "[$1] $2"; }
+if [[ $mode == migrate ]]; then
+  step 1 "checking server repo is clean and pushed"
+  chk=$(S "cd $qr && git status --porcelain | head -5; git stash list | head -3 | sed 's/^/stash: /'; for b in \$(git for-each-ref --format='%(refname:short)' refs/heads); do n=\$(git rev-list --count origin/\$b..\$b 2>/dev/null || echo unpushed); [ \"\$n\" = 0 ] || echo \"branch \$b: \$n unpushed\"; done") \
+    || die 2 "server check failed"
+  [[ -z $chk ]] || die 10 "server repo is not clean/pushed — fix it first:
+$chk"
+  if [[ $local_git == 1 ]]; then
+    [[ $(git -C "$DIR" rev-parse HEAD) == $(S "cd $qr && git rev-parse HEAD") ]] || die 10 "$DIR/.git exists but HEAD differs from the server; align them first"
+    [[ -z $(git -C "$DIR" status --porcelain) ]] || die 10 "$DIR has uncommitted changes; commit or stash them first"
+  else
+    step 1 "copying server .git to $DIR"
+    mkdir -p "$DIR"
+    tmo 1800 rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$RPATH/.git/" "$DIR/.git/" || die 2 "rsync of .git failed"
+    git -C "$DIR" reset -q --hard HEAD || die 2 "checkout in $DIR failed"
+  fi
+  step 1 "recording server-only ignored files"
+  S "cd $qr && git status --porcelain --ignored" | sed -n 's/^!! //p' | sed 's#/$##; s#^#/#' >"$DIR/.remote-dev.ignores"
+  step 1 "renaming server .git -> .git.migrated-$DATE"
+  S "mv $qr/.git $qr/.git.migrated-$DATE" || die 2 "rename failed"
+elif [[ $mode == new ]]; then
+  step 1 "creating $HOST:$RPATH"
+  S "mkdir -p $qr" || die 2 "mkdir failed"
+  if [[ $local_git == 0 ]]; then
+    step 1 "git init in $DIR"
+    mkdir -p "$DIR" && git -C "$DIR" init -q -b main || die 2 "git init failed"
+  fi
+fi
+
+# ---------- 2. ignores, .gitignore, config
+IGN=(.DS_Store /.claude /.codex /.remote-dev.toml /.remote-dev.ignores .env '.git.migrated-*')
+for s in ${STACK//,/ }; do
+  case $s in
+    go) IGN+=(/bin /dist) ;;
+    node) IGN+=(node_modules /dist /build /.next /coverage) ;;
+    python) IGN+=(__pycache__ .venv venv '*.pyc' .pytest_cache .mypy_cache) ;;
+    *) die 2 "unknown stack '$s' (go, node, python)" ;;
+  esac
+done
+if [[ -f $DIR/.remote-dev.ignores ]]; then
+  while IFS= read -r p; do [[ -n $p ]] && IGN+=("$p"); done <"$DIR/.remote-dev.ignores"
+fi
+
+if [[ -z $(git -C "$DIR" rev-parse -q --verify HEAD 2>/dev/null) ]]; then
+  step 2 "initial commit"
+  [[ -f $DIR/.gitignore ]] || printf '%s\n' "${IGN[@]}" | grep -v -e '^/\.remote-dev' -e '^\.git\.migrated' >"$DIR/.gitignore"
+  git -C "$DIR" add .gitignore && git -C "$DIR" commit -q -m "chore: initialize project" || die 2 "initial commit failed"
+fi
+
+if [[ ! -f $DIR/.remote-dev.toml ]]; then
+  step 2 "writing .remote-dev.toml"
+  cat >"$DIR/.remote-dev.toml" <<EOF
+# remote-dev config for rdev (local only, excluded via .git/info/exclude)
+host        = "$HOST"
+machine     = "$MACHINE"
+remote_path = "$RPATH"
+mutagen     = "$SESSION"
+name        = "$NAME"
+EOF
+fi
+ex="$DIR/.git/info/exclude"; mkdir -p "$(dirname "$ex")"
+for f in .remote-dev.toml .remote-dev.ignores .build-meta.json .build-meta.files; do
+  grep -qxF "$f" "$ex" 2>/dev/null || echo "$f" >>"$ex"
+done
+
+# ---------- 3. mutagen
+if [[ $session_exists == 0 ]]; then
+  step 3 "creating mutagen session '$SESSION'"
+  args=(); for p in "${IGN[@]}"; do args+=(--ignore "$p"); done
+  tmo 300 mutagen sync create --name "$SESSION" --mode two-way-safe --ignore-vcs "${args[@]}" "$DIR" "$HOST:$RPATH" >/dev/null || die 2 "mutagen sync create failed"
+fi
+step 3 "flushing initial sync"
+tmo 1800 mutagen sync flush "$SESSION" >/dev/null || die 2 "initial sync did not complete (mutagen sync list $SESSION)"
+mutagen sync list "$SESSION" | grep -q '^Conflicts:' && die 10 "initial sync has conflicts (mutagen sync list $SESSION)"
+
+# ---------- 4. herdr
+if [[ $machine_ok == 0 ]]; then
+  die 20 "herdr machine '$MACHINE' is not saved. The user must run in their terminal:  herdr machine add $HOST
+then re-run this command (finished steps are skipped)."
+fi
+
+# ---------- 5. verify
+step 5 "verifying with rdev"
+cd "$DIR" && "$RDEV" up --quiet || die 2 "rdev up failed"
+"$RDEV" --timeout 60 'pwd && echo "VERSION=$VERSION COMMIT=$COMMIT" && ls -A | head -20' || die 2 "rdev verification run failed"
+say "done: $DIR <-> $HOST:$RPATH (mutagen '$SESSION', herdr workspace rdev-$NAME). Git: $(git -C "$DIR" log --oneline -1)"

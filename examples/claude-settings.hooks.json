@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh session", "timeout": 20 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh prompt", "timeout": 10 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh guard", "timeout": 10 } ] }
+    ]
+  }
+}
