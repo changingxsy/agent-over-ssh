@@ -5,8 +5,11 @@
 # Usage:
 #   remote-dev-init --host H --remote /abs/path [--dir ~/work/NAME] [--name NAME]
 #                   [--stack go,node,python] [--machine LABEL] [--migrate-server-git] [--plan]
+#                   [--ignore PATTERN]...
 #
 #   --plan                 read-only: probe both sides and print what would be done
+#   --ignore PATTERN       keep PATTERN server-only (not synced), e.g. /data /checkpoints *.ckpt;
+#                          repeatable, mutagen ignore syntax, recorded in .remote-dev.ignores
 #   --migrate-server-git   the remote dir already has .git: pull it to the local repo
 #                          and rename the server copy to .git.migrated-<date> (reversible)
 #
@@ -18,7 +21,7 @@ say() { printf '%s\n' "$*"; }
 die() { local c=$1; shift; printf 'remote-dev-init: %s\n' "$*" >&2; exit "$c"; }
 tmo() { local s=$1; shift; perl -e '$t = shift; alarm $t; exec @ARGV; exit 127' "$s" "$@"; }
 
-HOST="" RPATH="" DIR="" NAME="" STACK="" MACHINE="" MIGRATE=0 PLAN=0
+HOST="" RPATH="" DIR="" NAME="" STACK="" MACHINE="" MIGRATE=0 PLAN=0 EXTRA=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     --host) HOST=$2; shift 2 ;;
@@ -26,10 +29,11 @@ while [[ $# -gt 0 ]]; do
     --dir) DIR=${2%/}; shift 2 ;;
     --name) NAME=$2; shift 2 ;;
     --stack) STACK=$2; shift 2 ;;
+    --ignore) EXTRA+=("$2"); shift 2 ;;
     --machine) MACHINE=$2; shift 2 ;;
     --migrate-server-git) MIGRATE=1; shift ;;
     --plan) PLAN=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) die 2 "unknown argument: $1" ;;
   esac
 done
@@ -78,6 +82,7 @@ if [[ $PLAN == 1 ]]; then
     migrate) say "will:      check server repo is clean/pushed; copy server .git to $DIR and check out; rename server .git -> .git.migrated-$DATE; create mutagen session '$SESSION'" ;;
     resume) say "will:      finish remaining steps (config / mutagen / herdr / verification)" ;;
   esac
+  [[ -n ${EXTRA[*]-} ]] && say "server-only (not synced): ${EXTRA[*]}"
   [[ $machine_ok == 1 ]] || say "manual:    herdr machine '$MACHINE' not saved — user must run: herdr machine add $HOST"
   exit 0
 fi
@@ -121,6 +126,9 @@ for s in ${STACK//,/ }; do
     python) IGN+=(__pycache__ .venv venv '*.pyc' .pytest_cache .mypy_cache) ;;
     *) die 2 "unknown stack '$s' (go, node, python)" ;;
   esac
+done
+for p in ${EXTRA[@]+"${EXTRA[@]}"}; do
+  grep -qxF -- "$p" "$DIR/.remote-dev.ignores" 2>/dev/null || echo "$p" >>"$DIR/.remote-dev.ignores"
 done
 if [[ -f $DIR/.remote-dev.ignores ]]; then
   while IFS= read -r p; do [[ -n $p ]] && IGN+=("$p"); done <"$DIR/.remote-dev.ignores"

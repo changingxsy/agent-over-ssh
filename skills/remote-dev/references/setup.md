@@ -5,6 +5,7 @@ Tool: `remote-dev-init` (not auto-approved on purpose — the user sees each run
 ```
 remote-dev-init --host H --remote /abs/path [--dir ~/work/NAME] [--name NAME]
                 [--stack go,node,python] [--machine LABEL] [--migrate-server-git] [--plan]
+                [--ignore PATTERN]...
 ```
 
 ## Procedure
@@ -14,6 +15,7 @@ remote-dev-init --host H --remote /abs/path [--dir ~/work/NAME] [--name NAME]
    - `--remote`: absolute project directory on the server (not `/`, not a home dir itself).
    - `--dir`: defaults to `~/work/<basename of remote>`.
    - `--stack`: decides extra mutagen ignores / initial `.gitignore` (go: `/bin /dist`; node: `node_modules /dist /build /.next /coverage`; python: `__pycache__ .venv venv *.pyc ...`).
+   - `--ignore` (repeatable): paths that stay **server-only** and are never synced — datasets, model weights, checkpoints, experiment outputs, logs. Only lightweight code should come to the laptop, so ask the user which large directories exist (for an existing remote dir, look at its top-level sizes with the user) and confirm the list; changing it later means recreating the mutagen session.
    Authorization: a user request to "create/initialize a project" counts as approval for `git init` in that new directory. Do not `git init` anywhere else.
 2. **Plan (read-only):** `remote-dev-init ... --plan`. Show the user the mode and actions:
    - `new` — remote dir missing/empty: `mkdir -p` remote, `git init` + initial commit locally, config, mutagen.
@@ -27,7 +29,7 @@ remote-dev-init --host H --remote /abs/path [--dir ~/work/NAME] [--name NAME]
 ## What it creates
 
 - Local: Git repo, `.remote-dev.toml` (host, machine, remote_path, mutagen, name), excludes in `.git/info/exclude` for `.remote-dev.toml`, `.remote-dev.ignores`, `.build-meta.json`, `.build-meta.files`.
-- mutagen session `<name>`, `two-way-safe`, `--ignore-vcs`, ignores = common (`.DS_Store /.claude /.codex .env .git.migrated-* ...`) + stack + (migration) every path the server's Git ignored, saved in `.remote-dev.ignores`.
+- mutagen session `<name>`, `two-way-safe`, `--ignore-vcs`, ignores = common (`.DS_Store /.claude /.codex .env .git.migrated-* ...`) + stack + `--ignore` paths + (migration) every path the server's Git ignored; the last two are saved in `.remote-dev.ignores`.
 - Server: the directory, and on first `rdev` use a herdr workspace `rdev-<name>` with cwd = remote dir.
 
 ## Version metadata (no Git on the server)

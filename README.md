@@ -1,31 +1,59 @@
 # tether
 
-**Edit locally, run remotely.** A small toolkit that lets you (and coding agents such as Claude Code or Codex) work on a project whose code lives on your laptop but builds and runs on an SSH server.
+**Connect your local AI agents to any server — over SSH alone.** Agents, credentials and Git stay on your machine; the server only runs code, reached through a single SSH port.
 
 [简体中文](README.zh-CN.md)
 
 ```
- laptop                                         server
-┌───────────────────────────┐   mutagen    ┌──────────────────────────┐
-│ ~/work/myproj  (Git here) │ ◀──────────▶ │ /srv/myproj  (no .git)   │
-│                           │  two-way-safe│                          │
-│ rdev 'go test ./...' ─────┼──── herdr ──▶│ herdr workspace          │
-│   ◀── output + exit code ─┼──────────────│   rdev-myproj (pane)     │
-└───────────────────────────┘              └──────────────────────────┘
+laptop: Claude Code / Codex · API keys · Git token · MCP · ~/work/myproj (Git)
+  │
+  │  SSH (the only port used, no port forwarding)
+  │   ├─ mutagen: syncs the code; datasets and models stay on the server
+  │   └─ herdr  : rdev 'python train.py' runs in a persistent pane, survives
+  │               network loss, streams output and exit code back
+  ▼
+server: /srv/myproj (no .git, no credentials, just runs code)
 ```
 
-- **[mutagen](https://mutagen.io)** keeps the local folder and the server directory in sync.
-- **[herdr](https://herdr.dev)** keeps a persistent pane on the server, so long jobs survive laptop sleep and network changes.
-- **Git stays local.** The server copy has no `.git`; version info is injected into every run.
-- **`rdev`** ties it together: check & flush the sync, run the command in the pane, stream back output and the remote exit code.
+## Why tether
 
-## Why
+Research and development often means juggling several servers: a lab GPU box, a university cluster, a cloud VM. Letting an AI agent work directly on each of them means installing, logging in and configuring Claude Code / Codex, API keys, Git credentials, MCP servers, skills and preferences on every machine — all things that are already set up on your laptop. Repeating that remotely is tedious, and it puts your credentials on machines someone else administers.
 
-Agents and editors work best on local files, but the toolchain, data or GPU is on the server. Running commands over plain `ssh` breaks on every Wi‑Fi change, and keeping Git on both sides invites divergence. tether makes the server a pure execution target:
+tether turns it around: **the agent stays local, the server is only an execution target, and the two talk over SSH only.**
 
-- `rdev` refuses to run on stale code: it waits for the sync to connect and flushes it first.
-- A command that is running when the network drops **keeps running** on the server; `rdev --wait TOKEN` collects it later instead of re-running it.
-- Hooks for Claude Code / Codex inject the sync status at session start, warn about conflicts or uncollected jobs, and block direct `ssh`/`scp` to the dev host.
+- **Credentials never leave your machine.** API keys, agent logins, Git/GitHub tokens and MCP configs exist only locally. The server holds the project code plus two helper binaries that mutagen and herdr deploy over SSH (neither carries credentials). On a shared server, other users and admins never get near your keys.
+- **Works wherever SSH works.** Many servers forbid port forwarding, expose no extra ports, or have no outbound internet, which rules out setups where an agent connects through a forwarded port. tether's sync (mutagen) and remote execution (herdr) both start a helper on the server over SSH and talk to it over stdin/stdout — **no port forwarding, no extra open ports**. If you can log in, you can use it.
+- **Configure once, reuse everywhere.** Adding a server takes one alias in `~/.ssh/config` and one `remote-dev-init`; your local agent setup is reused as is.
+- **Full coordination on top of one SSH link.** Sync, remote execution, surviving disconnects, version metadata and agent guardrails all run over that connection:
+  - `rdev` refuses to run on stale code: it waits for the sync to connect and flushes it first.
+  - A command running when the network drops or the lid closes **keeps running** on the server; `rdev --wait TOKEN` collects it later instead of re-running it.
+  - Git stays local; the server has no `.git`, so the two sides cannot diverge. Version info is injected into every run.
+  - Hooks for Claude Code / Codex inject the sync status at session start, warn about conflicts or uncollected jobs, and block direct `ssh`/`scp` to the dev host.
+
+## What lives where
+
+tether brings only the **lightweight code** to your laptop; large files stay on the server and are never synced. So during setup you decide which paths are synced and which stay server-only:
+
+| synced (both sides) | server-only (exclude with `--ignore`) | local only |
+|---|---|---|
+| source, configs, scripts, docs, small test fixtures | datasets, model weights, checkpoints, experiment outputs, logs, virtualenvs, build artifacts | `.git`, agent config and credentials, `.remote-dev.toml` |
+
+```bash
+remote-dev-init --host gpu1 --remote /data/me/myproj --stack python \
+  --ignore /data --ignore /checkpoints --ignore /outputs --ignore '*.ckpt' --plan
+```
+
+- `--stack` excludes common artifacts (e.g. `.venv`, `__pycache__` for python); `--ignore` adds your project's own large paths, in mutagen ignore syntax (`/data` means `data` at the project root).
+- When migrating an existing server-side Git project (`--migrate-server-git`), everything that repo's `.gitignore` ignored becomes server-only automatically.
+- Excluded paths are never deleted on either side, just not synced. To change the list after setup, recreate the mutagen session: `mutagen sync terminate <name>`, then `mutagen sync create` with the new ignores (see step 3 of `remote-dev-init`), and update `.remote-dev.ignores`.
+
+## Components
+
+- **[mutagen](https://mutagen.io)** — two-way-safe sync of the local folder and the server directory, over SSH.
+- **[herdr](https://herdr.dev)** — a persistent pane on the server, over SSH; jobs survive laptop sleep and network changes.
+- **`rdev`** — check & flush the sync, run the command in the pane, stream back output and the remote exit code.
+- **`remote-dev-init`** — set up or migrate a project.
+- **hooks + skill** — make Claude Code / Codex follow this workflow.
 
 ## Requirements
 
