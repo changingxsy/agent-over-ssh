@@ -1,1 +1,7 @@
 .DS_Store
+# local agent / machine-specific files
+CLAUDE.local.md
+.claude/settings.local.json
+.remote-dev.toml
+.remote-dev.ignores
+.build-meta.*
