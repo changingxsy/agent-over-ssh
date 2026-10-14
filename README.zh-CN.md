@@ -54,6 +54,56 @@ remote-dev-init --host gpu1 --remote /data/me/myproj --stack python \
 - **`remote-dev-init`**：新建或迁移项目。
 - **hooks + skill**：让 Claude Code / Codex 按这套流程工作。
 
+## 封装了什么：命令分流
+
+tether 的核心是把“在哪里执行”这件事封装起来：Agent 只管在本地改代码和调用 `rdev`，同步、远程执行、断网恢复都由下面几层处理。
+
+### 1. `rdev`：远程执行的唯一入口
+
+`rdev '<cmd>'` 每次运行都会依次：
+
+1. 从当前目录向上查找 `.remote-dev.toml`，把本地子目录映射到服务器上对应的子目录。
+2. 检查 mutagen 同步：未连接时等待（默认 30 秒），暂停时自动恢复，然后 flush；有冲突或同步离线就**拒绝运行**，保证不会在旧代码上执行。
+3. 找到或创建服务器上的 herdr workspace `rdev-<name>`。同一项目同时只允许一个命令，忙时拒绝。
+4. 注入本地 Git 的版本信息（`VERSION`、`COMMIT` 等），在 pane 中执行，输出写入服务器上的日志和退出码文件。
+5. 等待结束并取回输出；断网时最多等 `net_wait` 秒，任务在服务器上继续运行，凭 TOKEN 之后收取。
+6. 结束后再 flush 一次，把服务器上生成的文件（格式化结果、代码生成、lockfile）同步回本地。
+
+### 2. 命令在哪里执行
+
+| 命令类别 | 例子 | 在哪执行 | 靠什么保证 |
+|---|---|---|---|
+| 读写代码、搜索 | Agent 的文件工具、`rg`、`grep` | 本地 | 本来就在本地；mutagen 自动同步到服务器 |
+| Git | `git commit`、`git push` | 本地 | 服务器没有 `.git`，在那边跑不了 Git；规则里也写明 Git 只在本地 |
+| 构建、测试、训练等需要服务器环境的命令 | `rdev 'pytest'`、`rdev --bg 'python train.py'` | 服务器 | **规则提示**：会话开始时 hook 注入规则，skill 里也写明（见下文） |
+| 直接 `ssh`/`scp`/`sftp` 到开发机 | `ssh devbox ...` | 禁止 | **硬性拦截**：PreToolUse hook 拒绝，并提示改用 `rdev` |
+| 被委派的 Agent 运行 `rdev`/`mutagen`/`herdr` | Claude Code 调用的 Codex | 禁止 | **硬性拦截**：委派的 Agent 只改代码，验证由主 Agent 用 `rdev` 完成 |
+
+hooks 只在含有 `.remote-dev.toml` 的项目里生效，其他目录完全不受影响。
+
+| hook | 作用 |
+|---|---|
+| `SessionStart` | 运行 `rdev up --quiet`，把同步/herdr 状态和上述规则注入 Agent 上下文；委派的 Agent 收到的是“只改代码”的规则 |
+| `UserPromptSubmit` | 每轮对话前只做本地检查（不连服务器）；只在同步断开、有冲突或有未收取任务时提示 |
+| `PreToolUse` | 上表中的两项硬性拦截 |
+
+### 3. AI 无意中在本地运行了服务器命令会怎样
+
+目前**不会被拦截**，这一类靠规则约束：
+
+- 会话一开始，Agent 的上下文里就有“服务器命令一律用 `rdev '<cmd>'`”的规则和当前同步状态，[`SKILL.md`](skills/remote-dev/SKILL.md) 里也有同样的说明和退出码处理方法。
+- 本地通常没有服务器上的数据、GPU 或工具链（它们本来就是只留在服务器的），这类命令在本地往往会直接失败，Agent 会根据规则改用 `rdev`。
+- 但如果本地恰好有相同环境，命令就会在本地执行，结果可能和服务器上不一致。对这类命令有更严格要求时，可以按下一节自己加拦截规则。
+
+## 自定义规则：hook 就是你本机上的代码
+
+所有 hook 都是本机上的 bash 脚本（[`hooks/rdev-hook.sh`](hooks/rdev-hook.sh)），由你自己的 `~/.claude/settings.json` / `~/.codex/hooks.json` 引用，没有任何远程配置。如果某条规则和你要跑的命令冲突，或者你想加更严格的限制，直接改它即可：
+
+- **放宽**：调整 `guard` 分支里的匹配规则，或者从 settings 中删掉对应的 hook。
+- **收紧**：在 `guard` 分支里加自己的拒绝规则，例如禁止在本地运行 `python train.py`、`torchrun`，返回 `permissionDecision: "deny"` 并提示改用 `rdev`。
+- **验证**：把新例子加到 [`tests/guard-cases.txt`](tests/guard-cases.txt)（`#EXPECT-DENY` 之前的应放行，之后的应拒绝），运行 `tests/run-guard-tests.sh`。
+- 改动在下一次工具调用或下一个会话生效，不用重启。建议 fork 后在自己的分支上修改，方便以后合并上游更新。
+
 ## 依赖
 
 - macOS（已验证）或 Linux（未验证），`bash`、`jq`、`perl`，`~/.ssh/config` 中配置好的主机别名
@@ -101,16 +151,6 @@ rdev up                               # 检查/修复同步、herdr pane，列�
 ## 服务器无 Git 时的版本信息
 
 每次 `rdev` 运行都会导出 `VERSION`（`git describe --tags --always --dirty`）、`COMMIT`、`COMMIT_FULL`、`BUILD_DATE`、`SOURCE_DIRTY`，并在同步目录写入 `.build-meta.json` / `.build-meta.files`，供不经 `rdev` 启动的构建使用。
-
-## 配合编码 Agent
-
-[`skills/remote-dev/SKILL.md`](skills/remote-dev/SKILL.md) 是 Claude Code / Codex 格式的 skill，描述工作流程和退出码处理。启用 hooks 后：
-
-| hook | 作用 |
-|---|---|
-| `SessionStart` | 运行 `rdev up --quiet`，注入状态和规则 |
-| `UserPromptSubmit` | 仅本地检查；只在断连、冲突或有未收取任务时提示 |
-| `PreToolUse` | 拦截到开发机的 `ssh`/`scp`/`sftp`；由 Claude Code 委派的 Codex 不得运行 `rdev`/`mutagen`/`herdr` |
 
 ## 测试
 

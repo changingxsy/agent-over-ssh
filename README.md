@@ -55,6 +55,56 @@ remote-dev-init --host gpu1 --remote /data/me/myproj --stack python \
 - **`remote-dev-init`** — set up or migrate a project.
 - **hooks + skill** — make Claude Code / Codex follow this workflow.
 
+## What is wrapped: routing commands
+
+tether's core is hiding *where* things run. The agent only edits code locally and calls `rdev`; the layers below handle sync, remote execution and recovery.
+
+### 1. `rdev`: the single entry point for remote execution
+
+Each `rdev '<cmd>'`:
+
+1. Finds `.remote-dev.toml` upward from the current directory and maps the local subdirectory to the matching one on the server.
+2. Checks the mutagen sync: waits if it is connecting (30 s by default), resumes it if paused, then flushes. It **refuses to run** on conflicts or an offline sync, so nothing runs on stale code.
+3. Finds or creates the herdr workspace `rdev-<name>` on the server. One command per project at a time; a busy pane is refused.
+4. Injects version info from local Git (`VERSION`, `COMMIT`, …), runs the command in the pane, and records its log and exit code on the server.
+5. Waits and streams back the output. During a network loss it keeps retrying for up to `net_wait` seconds; the job keeps running on the server and can be collected later by its TOKEN.
+6. Flushes once more so files generated on the server (formatting, codegen, lockfiles) come back to your laptop.
+
+### 2. Where each command runs
+
+| kind of command | examples | runs on | enforced by |
+|---|---|---|---|
+| reading/writing code, searching | the agent's file tools, `rg`, `grep` | laptop | that's where the files are; mutagen syncs them |
+| Git | `git commit`, `git push` | laptop | the server has no `.git`, so Git cannot run there; the rules say so too |
+| builds, tests, training — anything that needs the server's environment | `rdev 'pytest'`, `rdev --bg 'python train.py'` | server | **rules**: injected by the session hook and stated in the skill (see below) |
+| direct `ssh`/`scp`/`sftp` to the dev host | `ssh devbox ...` | blocked | **hard block**: the PreToolUse hook denies it and points to `rdev` |
+| a delegated agent running `rdev`/`mutagen`/`herdr` | Codex invoked by Claude Code | blocked | **hard block**: delegated agents only edit; the main agent verifies with `rdev` |
+
+Hooks only act inside projects that contain `.remote-dev.toml`; every other directory is untouched.
+
+| hook | what it does |
+|---|---|
+| `SessionStart` | runs `rdev up --quiet` and injects the sync/herdr status and the rules above; a delegated agent gets "edit only" rules instead |
+| `UserPromptSubmit` | a local-only check before each turn (no server contact); speaks up only on disconnect, conflicts or uncollected jobs |
+| `PreToolUse` | the two hard blocks in the table |
+
+### 3. What if the agent runs a server command locally by mistake?
+
+It is **not blocked** today; this category relies on the rules:
+
+- From the first turn, the agent's context says "run server commands with `rdev '<cmd>'`" along with the current sync status, and [`SKILL.md`](skills/remote-dev/SKILL.md) repeats it with an exit-code playbook.
+- The laptop usually lacks the server's data, GPU or toolchain (those are server-only by design), so such a command tends to fail locally and the agent switches to `rdev`.
+- If your laptop happens to have the same environment, the command will run locally and may give different results. If that matters for your project, add your own block as described next.
+
+## Customizing: the hooks are code on your machine
+
+Every hook is a plain bash script on your laptop ([`hooks/rdev-hook.sh`](hooks/rdev-hook.sh)), referenced from your own `~/.claude/settings.json` / `~/.codex/hooks.json`; nothing is configured remotely. If a rule gets in the way of a command you need, or you want stricter limits, edit it:
+
+- **Relax**: adjust the patterns in the `guard` branch, or drop the hook from your settings.
+- **Tighten**: add your own deny rules in the `guard` branch — e.g. block local `python train.py` or `torchrun` — returning `permissionDecision: "deny"` with a hint to use `rdev`.
+- **Test**: add examples to [`tests/guard-cases.txt`](tests/guard-cases.txt) (lines before `#EXPECT-DENY` must be allowed, lines after it denied) and run `tests/run-guard-tests.sh`.
+- Changes apply on the next tool call or session; nothing to restart. Keeping your edits on a branch of your fork makes upstream updates easy to merge.
+
 ## Requirements
 
 - macOS (tested) or Linux (untested), `bash`, `jq`, `perl`, OpenSSH with a host alias in `~/.ssh/config`
@@ -102,16 +152,6 @@ Per-project configuration lives in `.remote-dev.toml` ([example](examples/remote
 ## Build metadata without Git on the server
 
 Every `rdev` run exports `VERSION` (`git describe --tags --always --dirty`), `COMMIT`, `COMMIT_FULL`, `BUILD_DATE` and `SOURCE_DIRTY`, and writes `.build-meta.json` / `.build-meta.files` into the synced tree for builds that are not started by `rdev`.
-
-## Using with coding agents
-
-[`skills/remote-dev/SKILL.md`](skills/remote-dev/SKILL.md) is an agent skill (Claude Code / Codex format) describing the workflow and the exit-code playbook. With the hooks installed:
-
-| hook | what it does |
-|---|---|
-| `SessionStart` | runs `rdev up --quiet` and injects the status + rules |
-| `UserPromptSubmit` | local-only check; speaks up only on disconnect, conflicts or uncollected jobs |
-| `PreToolUse` | denies `ssh`/`scp`/`sftp` to the dev host; a Codex agent delegated by Claude Code may not run `rdev`/`mutagen`/`herdr` |
 
 ## Tests
 
