@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install tether by symlinking it into place (re-run safely; existing non-tether files are left alone).
+# Install agent-over-ssh by symlinking it into place (re-run safely; existing files not managed by it are left alone).
 #   ./install.sh            bin -> ~/.local/bin, skill -> ~/.claude/skills and ~/.codex/skills (if present)
 #   BIN_DIR=/usr/local/bin ./install.sh
 # Hooks are not wired automatically: the script prints the JSON to merge into your settings.
@@ -10,7 +10,7 @@ BIN_DIR=${BIN_DIR:-$HOME/.local/bin}
 link() { # link SRC DEST
   local src=$1 dest=$2
   if [[ -L $dest && $(readlink "$dest") == "$src" ]]; then echo "ok       $dest"; return; fi
-  if [[ -e $dest || -L $dest ]]; then echo "skipped  $dest (exists; move it away to let tether manage it)"; return; fi
+  if [[ -e $dest || -L $dest ]]; then echo "skipped  $dest (exists; move it away to let agent-over-ssh manage it)"; return; fi
   mkdir -p "$(dirname "$dest")"; ln -s "$src" "$dest"; echo "linked   $dest -> $src"
 }
 

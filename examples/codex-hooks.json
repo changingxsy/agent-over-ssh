@@ -1,13 +1,13 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh session codex", "timeout": 20 } ] }
+      { "hooks": [ { "type": "command", "command": "bash /path/to/agent-over-ssh/hooks/rdev-hook.sh session codex", "timeout": 20 } ] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh prompt codex", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "bash /path/to/agent-over-ssh/hooks/rdev-hook.sh prompt codex", "timeout": 10 } ] }
     ],
     "PreToolUse": [
-      { "hooks": [ { "type": "command", "command": "bash /path/to/tether/hooks/rdev-hook.sh guard codex", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "bash /path/to/agent-over-ssh/hooks/rdev-hook.sh guard codex", "timeout": 10 } ] }
     ]
   }
 }

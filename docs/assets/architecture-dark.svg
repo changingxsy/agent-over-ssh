@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="432" viewBox="0 0 960 432" role="img" aria-label="Edit locally · run remotely · Git and credentials never leave the laptop">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #f0f6fc; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.h { font-size: 18px; font-weight: 600; }
+.sub { font-size: 13px; fill: #9198a1; }
+.ct { font-size: 14px; font-weight: 600; }
+.cs { font-size: 12px; fill: #9198a1; }
+.lane { font-size: 14px; font-weight: 600; }
+.note { font-size: 12px; fill: #9198a1; }
+</style>
+<defs>
+<marker id="af" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#4493f8"/></marker>
+<marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ab7df8"/></marker>
+</defs>
+<rect x="16" y="40" width="300" height="352" rx="14" fill="#151b23" stroke="#3d444d"/>
+<text class="h" x="36" y="74">Your laptop</text>
+<text class="sub" x="36" y="95">agents and credentials stay here</text>
+<rect x="32" y="114" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="46" y="137">AI agent</text>
+<text class="cs" x="46" y="156">Claude Code · Codex</text>
+<rect x="32" y="180" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="46" y="203">Credentials</text>
+<text class="cs" x="46" y="222">API keys · Git token · MCP</text>
+<rect x="32" y="246" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="46" y="269">Git repo  ~/work/myproj</text>
+<text class="cs" x="46" y="288">lightweight code only</text>
+<rect x="32" y="312" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="46" y="335">rdev + hooks</text>
+<text class="cs" x="46" y="354">command entry · agent guardrails</text>
+<rect x="644" y="40" width="300" height="352" rx="14" fill="#151b23" stroke="#3d444d"/>
+<text class="h" x="664" y="74">Server</text>
+<text class="sub" x="664" y="95">only runs code · containers are fine</text>
+<rect x="660" y="114" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="674" y="137">Server environment</text>
+<text class="cs" x="674" y="156">toolchain · GPU · cluster</text>
+<rect x="660" y="180" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d" stroke-dasharray="5 4"/>
+<text class="ct" x="674" y="203">Server-only files</text>
+<text class="cs" x="674" y="222">datasets · weights · outputs</text>
+<rect x="660" y="246" width="268" height="54" rx="9" fill="#0d1117" stroke="#3d444d"/>
+<text class="ct" x="674" y="269">/srv/myproj</text>
+<text class="cs" x="674" y="288">synced code · no .git · no keys</text>
+<rect x="660" y="312" width="268" height="54" rx="9" fill="#2b1c4b" stroke="#ab7df8"/>
+<text class="ct" x="674" y="335">herdr pane  rdev-myproj</text>
+<text class="cs" x="674" y="354">survives drops · watch it live</text>
+<rect x="336" y="188" width="288" height="204" rx="16" fill="#0d1117" stroke="#656c76" stroke-width="1.5" stroke-dasharray="7 5"/>
+<rect x="420" y="112" width="120" height="30" rx="15" fill="#151b23" stroke="#656c76"/>
+<text class="ct mono" x="480" y="132" text-anchor="middle">SSH</text>
+<text class="note" x="480" y="166" text-anchor="middle">one SSH connection · no extra ports</text>
+<line x1="480" y1="142" x2="480" y2="152" stroke="#656c76" stroke-width="1.5"/>
+<line x1="480" y1="174" x2="480" y2="188" stroke="#656c76" stroke-width="1.5"/>
+<rect x="352" y="198" width="256" height="90" rx="10" fill="#0c2d6b" fill-opacity="0.55"/>
+<text class="lane" x="480" y="219" text-anchor="middle" style="fill:#4493f8">① File routing · mutagen</text>
+<text class="note" x="480" y="239" text-anchor="middle">code synced both ways</text>
+<text class="note" x="480" y="256" text-anchor="middle">heavy data never leaves the server</text>
+<line x1="322" y1="273" x2="638" y2="273" stroke="#4493f8" stroke-width="2.5" marker-start="url(#af)" marker-end="url(#af)"/>
+<rect x="352" y="296" width="256" height="88" rx="10" fill="#2b1c4b" fill-opacity="0.55"/>
+<text class="lane" x="480" y="315" text-anchor="middle" style="fill:#ab7df8">② Command routing · herdr</text>
+<text class="note mono" x="480" y="331" text-anchor="middle">rdev 'pytest'</text>
+<line x1="322" y1="339" x2="638" y2="339" stroke="#ab7df8" stroke-width="2.5" marker-end="url(#ac)"/>
+<line x1="638" y1="356" x2="322" y2="356" stroke="#ab7df8" stroke-width="2.5" stroke-dasharray="6 4" marker-end="url(#ac)"/>
+<text class="note" x="480" y="375" text-anchor="middle">output + exit code</text>
+<text class="sub" x="480" y="418" text-anchor="middle">Edit locally · run remotely · Git and credentials never leave the laptop</text>
+</svg>
